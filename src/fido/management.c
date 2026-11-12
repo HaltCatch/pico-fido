@@ -59,6 +59,12 @@ static int man_unload(void) {
 }
 
 bool cap_supported(uint16_t cap) {
+#if !ENABLE_OATH_APP
+    if (cap & CAP_OATH) return false;
+#endif
+#if !ENABLE_OTP_APP
+    if (cap & CAP_OTP) return false;
+#endif
     file_t *ef = file_search(EF_DEV_CONF);
     if (file_has_data(ef)) {
         uint8_t *p = NULL;
@@ -93,13 +99,20 @@ int man_get_config(void) {
     res_APDU[res_APDU_size++] = 0; // Overall length. Filled later
     res_APDU[res_APDU_size++] = TAG_USB_SUPPORTED;
     res_APDU[res_APDU_size++] = 2;
-    uint16_t caps = CAP_FIDO2 | CAP_OTP | CAP_U2F | CAP_OATH;
+    uint16_t caps = CAP_FIDO2 | CAP_U2F;
+#if ENABLE_OTP_APP
+    caps |= CAP_OTP;
+#endif
+#if ENABLE_OATH_APP
+    caps |= CAP_OATH;
+#endif
     if (app_exists(CONST_BYTE_ARRAY(_openpgp_aid + 1, _openpgp_aid[0]))) {
         caps |= CAP_OPENPGP;
     }
     if (app_exists(CONST_BYTE_ARRAY(_piv_aid + 1, _piv_aid[0]))) {
         caps |= CAP_PIV;
     }
+    const uint16_t supported_caps = caps;
     res_APDU[res_APDU_size++] = caps >> 8;
     res_APDU[res_APDU_size++] = caps & 0xFF;
     res_APDU[res_APDU_size++] = TAG_SERIAL;
@@ -137,6 +150,7 @@ int man_get_config(void) {
         if (cap_supported(CAP_PIV)) {
             caps |= CAP_PIV;
         }
+        caps &= supported_caps;
         res_APDU[res_APDU_size++] = caps >> 8;
         res_APDU[res_APDU_size++] = caps & 0xFF;
         res_APDU[res_APDU_size++] = TAG_DEVICE_FLAGS;
@@ -154,6 +168,21 @@ int man_get_config(void) {
         }
         uint16_t config_len = (uint16_t)config_size;
         memcpy(res_APDU + res_APDU_size, file_get_data(ef), config_len);
+        /* Preserve stored preferences, but never advertise a compiled-out app
+         * as enabled. Enabling the app in a later build restores its preference. */
+        uint8_t *p = NULL;
+        tlv_item_t item;
+        tlv_ctx_t ctx;
+        tlv_ctx_init(BYTE_ARRAY(res_APDU + res_APDU_size, config_len), &ctx);
+        while (tlv_walk(&ctx, &p, &item)) {
+            if (item.tag == TAG_USB_ENABLED && (item.value.len == 1 || item.value.len == 2)) {
+                uint16_t enabled = item.value.len == 2 ? get_uint16_be(item.value.data) : item.value.data[0];
+                enabled &= supported_caps;
+                uint8_t *value = res_APDU + (item.value.data - res_APDU);
+                if (item.value.len == 2) value[0] = enabled >> 8;
+                value[item.value.len - 1] = enabled & 0xff;
+            }
+        }
         res_APDU_size += config_len;
     }
     res_APDU[0] = (uint8_t)(res_APDU_size - 1);

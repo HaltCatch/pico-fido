@@ -157,5 +157,6 @@ extern int credential_rp_count(uint16_t *count);
 extern int credential_rp_load(uint16_t index, CredentialRp *rp);
 extern void credential_rp_free(CredentialRp *rp);
 extern int credential_rp_legacy_decrement(const uint8_t rp_id_hash[RP_ID_HASH_LEN]);
+extern void credential_resident_capacity(uint16_t *existing, uint16_t *available);
 
 #endif // _CREDENTIAL_H_

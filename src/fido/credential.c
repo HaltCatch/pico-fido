@@ -33,6 +33,20 @@
 #include "otp.h"
 #include "resident_container.h"
 
+void credential_resident_capacity(uint16_t *existing, uint16_t *available) {
+    uint16_t used = 0, usable = 0;
+    for (uint16_t i = 0; i < MAX_RESIDENT_CREDENTIALS; i++) {
+        if (file_has_data(file_search((uint16_t)(EF_CRED + i)))) {
+            used++;
+        }
+        else if (resident_container_can_create((uint8_t)i)) {
+            usable++;
+        }
+    }
+    if (existing) *existing = used;
+    if (available) *available = MIN(usable, resident_container_available_files_capacity());
+}
+
 int credential_derive_chacha_key(uint8_t *outk, const uint8_t *);
 
 #define RP_RECORD_COUNT_LEN                 1
@@ -313,34 +327,38 @@ int credential_rp_legacy_decrement(const uint8_t rp_id_hash[RP_ID_HASH_LEN]) {
     return PICOKEYS_ERR_FILE_NOT_FOUND;
 }
 
-static int credential_silent_tag(const uint8_t *cred_id, size_t cred_id_len, const uint8_t *rp_id_hash, uint8_t outk[CRED_SILENT_HMAC_LEN]) {
+static int credential_silent_tag(const uint8_t *cred_id, size_t cred_id_len, const uint8_t *rp_id_hash, uint8_t outk[CRED_SILENT_TAG_LEN]) {
+    uint8_t derived[CRED_SILENT_HMAC_LEN], tag[CRED_SILENT_HMAC_LEN];
     mbedtls_sha256_context ctx;
     mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);
-    if (otp_key_1) {
-        mbedtls_sha256_update(&ctx, otp_key_1, CRED_SILENT_HMAC_LEN);
+    int ret = mbedtls_sha256_starts(&ctx, 0);
+    if (ret == 0) {
+        ret = otp_key_1 ? mbedtls_sha256_update(&ctx, otp_key_1, CRED_SILENT_HMAC_LEN) :
+            mbedtls_sha256_update(&ctx, pico_serial.id, sizeof(pico_serial.id));
     }
-    else {
-        mbedtls_sha256_update(&ctx, pico_serial.id, sizeof(pico_serial.id));
-    }
-    if (memcmp(cred_id, CRED_PROTO_25_S, CRED_PROTO_LEN) == 0) {
-        mbedtls_sha256_update(&ctx, certdev_sha256, sizeof(certdev_sha256));
-    }
-    mbedtls_sha256_update(&ctx, rp_id_hash, RP_ID_HASH_LEN);
-    mbedtls_sha256_finish(&ctx, outk);
+    if (ret == 0 && memcmp(cred_id, CRED_PROTO_25_S, CRED_PROTO_LEN) == 0)
+        ret = mbedtls_sha256_update(&ctx, certdev_sha256, sizeof(certdev_sha256));
+    if (ret == 0) ret = mbedtls_sha256_update(&ctx, rp_id_hash, RP_ID_HASH_LEN);
+    if (ret == 0) ret = mbedtls_sha256_finish(&ctx, derived);
     mbedtls_sha256_free(&ctx);
-
-    return mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), outk, CRED_SILENT_HMAC_LEN, cred_id, cred_id_len - CRED_SILENT_TAG_LEN, outk);
+    if (ret == 0) ret = mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+        derived, sizeof(derived), cred_id, cred_id_len - CRED_SILENT_TAG_LEN, tag);
+    if (ret == 0) memcpy(outk, tag, CRED_SILENT_TAG_LEN);
+    else mbedtls_platform_zeroize(outk, CRED_SILENT_TAG_LEN);
+    mbedtls_platform_zeroize(derived, sizeof(derived));
+    mbedtls_platform_zeroize(tag, sizeof(tag));
+    return ret;
 }
 
 int credential_verify(uint8_t *cred_id, size_t cred_id_len, const uint8_t *rp_id_hash, bool silent) {
-    if (cred_id_len < CRED_ENVELOPE_OVERHEAD) {
+    if (!cred_id || !rp_id_hash || cred_id_len < CRED_ENVELOPE_OVERHEAD) {
         return -1;
     }
     uint8_t key[32] = {0}, *iv = cred_id + CRED_PROTO_LEN, *cipher = cred_id + CRED_PROTO_LEN + CRED_IV_LEN,
             *tag = cred_id + cred_id_len - CRED_TAG_LEN;
     cred_proto_t proto = CRED_PROTO_21;
     if (memcmp(cred_id, CRED_PROTO_22_S, CRED_PROTO_LEN) == 0 || memcmp(cred_id, CRED_PROTO_25_S, CRED_PROTO_LEN) == 0) { // New format
+        if (cred_id_len < CRED_SILENT_ENVELOPE_OVERHEAD) return -1;
         tag = cred_id + cred_id_len - CRED_SILENT_TAG_LEN - CRED_TAG_LEN;
         proto = CRED_PROTO_25;
     }
@@ -350,11 +368,11 @@ int credential_verify(uint8_t *cred_id, size_t cred_id_len, const uint8_t *rp_id
         if (proto == CRED_PROTO_22 || proto == CRED_PROTO_25) {
             hdr_len += CRED_SILENT_TAG_LEN;
         }
-        credential_derive_chacha_key(key, cred_id);
+        ret = credential_derive_chacha_key(key, cred_id);
         mbedtls_chachapoly_context chatx;
         mbedtls_chachapoly_init(&chatx);
-        mbedtls_chachapoly_setkey(&chatx, key);
-        ret = mbedtls_chachapoly_auth_decrypt(&chatx, cred_id_len - hdr_len, iv, rp_id_hash, RP_ID_HASH_LEN, tag, cipher, cipher);
+        if (ret == 0) ret = mbedtls_chachapoly_setkey(&chatx, key);
+        if (ret == 0) ret = mbedtls_chachapoly_auth_decrypt(&chatx, cred_id_len - hdr_len, iv, rp_id_hash, RP_ID_HASH_LEN, tag, cipher, cipher);
         mbedtls_chachapoly_free(&chatx);
     }
     else {
@@ -363,8 +381,10 @@ int credential_verify(uint8_t *cred_id, size_t cred_id_len, const uint8_t *rp_id
         }
         uint8_t outk[CRED_SILENT_HMAC_LEN];
         ret = credential_silent_tag(cred_id, cred_id_len, rp_id_hash, outk);
-        ret = memcmp(outk, cred_id + cred_id_len - CRED_SILENT_TAG_LEN, CRED_SILENT_TAG_LEN);
+        if (ret == 0) ret = mbedtls_ct_memcmp(outk, cred_id + cred_id_len - CRED_SILENT_TAG_LEN, CRED_SILENT_TAG_LEN);
+        mbedtls_platform_zeroize(outk, sizeof(outk));
     }
+    mbedtls_platform_zeroize(key, sizeof(key));
     return ret;
 }
 
@@ -432,20 +452,23 @@ int credential_create(CborCharString *rpId, CborByteString *userId, CborCharStri
     size_t rs = cbor_encoder_get_buffer_size(&encoder, cbor_payload);
     *cred_id_len = CRED_SILENT_ENVELOPE_OVERHEAD + (uint16_t) rs;
     uint8_t key[32] = {0};
-    credential_derive_chacha_key(key, (const uint8_t *)CRED_PROTO);
+    int ret = credential_derive_chacha_key(key, (const uint8_t *)CRED_PROTO);
     uint8_t iv[CRED_IV_LEN] = {0};
     random_fill_buffer(BYTE_ARRAY(iv, sizeof(iv)));
     mbedtls_chachapoly_context chatx;
     mbedtls_chachapoly_init(&chatx);
-    mbedtls_chachapoly_setkey(&chatx, key);
-    int ret = mbedtls_chachapoly_encrypt_and_tag(&chatx, rs, iv, rp_id_hash, RP_ID_HASH_LEN, cred_id + CRED_PROTO_LEN + CRED_IV_LEN, cred_id + CRED_PROTO_LEN + CRED_IV_LEN, cred_id + CRED_PROTO_LEN + CRED_IV_LEN + rs);
+    if (ret == 0) ret = mbedtls_chachapoly_setkey(&chatx, key);
+    if (ret == 0) ret = mbedtls_chachapoly_encrypt_and_tag(&chatx, rs, iv, rp_id_hash, RP_ID_HASH_LEN, cred_id + CRED_PROTO_LEN + CRED_IV_LEN, cred_id + CRED_PROTO_LEN + CRED_IV_LEN, cred_id + CRED_PROTO_LEN + CRED_IV_LEN + rs);
     mbedtls_chachapoly_free(&chatx);
+    mbedtls_platform_zeroize(key, sizeof(key));
     if (ret != 0) {
         CBOR_ERROR(CTAP1_ERR_OTHER);
     }
     memcpy(cred_id, CRED_PROTO, CRED_PROTO_LEN);
     memcpy(cred_id + CRED_PROTO_LEN, iv, CRED_IV_LEN);
-    credential_silent_tag(cred_id, *cred_id_len, rp_id_hash, cred_id + CRED_PROTO_LEN + CRED_IV_LEN + rs + CRED_TAG_LEN);
+    if (credential_silent_tag(cred_id, *cred_id_len, rp_id_hash, cred_id + CRED_PROTO_LEN + CRED_IV_LEN + rs + CRED_TAG_LEN) != 0) {
+        CBOR_ERROR(CTAP1_ERR_OTHER);
+    }
 
 err:
     if (error != CborNoError) {
@@ -460,11 +483,10 @@ err:
 int credential_load(const uint8_t *cred_id, size_t cred_id_len, const uint8_t *rp_id_hash, Credential *cred) {
     int ret = 0;
     CborError error = CborNoError;
-    uint8_t *copy_cred_id = (uint8_t *) calloc(1, cred_id_len);
-    if (!cred) {
-        CBOR_ERROR(CTAP2_ERR_INVALID_CREDENTIAL);
-    }
+    if (!cred || !cred_id || !rp_id_hash || cred_id_len == 0) return CTAP2_ERR_INVALID_CREDENTIAL;
     memset(cred, 0, sizeof(Credential));
+    uint8_t *copy_cred_id = (uint8_t *) calloc(1, cred_id_len);
+    if (!copy_cred_id) return CTAP1_ERR_OTHER;
     memcpy(copy_cred_id, cred_id, cred_id_len);
     ret = credential_verify(copy_cred_id, cred_id_len, rp_id_hash, false);
     if (ret != 0) { // U2F?
@@ -541,12 +563,15 @@ int credential_load(const uint8_t *cred_id, size_t cred_id_len, const uint8_t *r
     }
     cred->id.present = true;
     cred->id.data = (uint8_t *) calloc(1, cred_id_len);
+    if (!cred->id.data) { CBOR_ERROR(CTAP1_ERR_OTHER); }
     memcpy(cred->id.data, cred_id, cred_id_len);
     cred->id.len = cred_id_len;
     cred->present = true;
 err:
+    mbedtls_platform_zeroize(copy_cred_id, cred_id_len);
     free(copy_cred_id);
     if (error != CborNoError) {
+        credential_free(cred);
         if (error == CborErrorImproperValue) {
             return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
         }

@@ -25,6 +25,7 @@
 #include "version.h"
 #include "crypto_utils.h"
 #include "random.h"
+#include "credential.h"
 #include "mbedtls/hkdf.h"
 
 #define CRED_STORE_STATE_SIZE 16
@@ -75,7 +76,7 @@ int cbor_get_info(void) {
     CborError error = CborNoError;
     uint8_t enc_identifier[DEV_STATE_SIZE] = { 0 }, enc_cred_store_state[DEV_STATE_SIZE] = { 0 };
     cbor_encoder_init(&encoder, ctap_resp->init.data + 1, CTAP_MAX_CBOR_PAYLOAD, 0);
-    uint8_t lfields = 22;
+    uint8_t lfields = 23;
     file_t *ef_ee_ea = file_search_by_fid(EF_EE_DEV_EA, NULL, SPECIFY_EF);
     bool enterprise_profile = ((get_opts() & FIDO2_OPT_EA) && file_has_data(ef_ee_ea));
 #ifndef ENABLE_EMULATION
@@ -227,6 +228,10 @@ int cbor_get_info(void) {
 
     CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x10));
     CBOR_CHECK(cbor_encode_uint(&mapEncoder, MAX_RPIDS_MINPIN_LENGTH)); // maxRPIDsForSetMinPINLength
+    uint16_t remaining_credentials = 0;
+    credential_resident_capacity(NULL, &remaining_credentials);
+    CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x14)); // remainingDiscoverableCredentials
+    CBOR_CHECK(cbor_encode_uint(&mapEncoder, remaining_credentials));
 #ifndef ENABLE_EMULATION
     if (phy_data.vid != 0x1050) {
 #endif

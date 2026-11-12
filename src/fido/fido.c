@@ -324,7 +324,10 @@ int verify_key(const uint8_t *appId, const uint8_t *keyHandle, mbedtls_ecp_keypa
     memcpy(key_base + CTAP_APPID_SIZE, keyHandle, KEY_PATH_LEN);
     ret = mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), d, 32, key_base, sizeof(key_base), hmac);
     mbedtls_platform_zeroize(d, sizeof(d));
-    return mbedtls_ct_memcmp(keyHandle + KEY_PATH_LEN, hmac, sizeof(hmac));
+    if (ret != 0) { mbedtls_platform_zeroize(hmac, sizeof(hmac)); return -2; }
+    ret = mbedtls_ct_memcmp(keyHandle + KEY_PATH_LEN, hmac, sizeof(hmac));
+    mbedtls_platform_zeroize(hmac, sizeof(hmac));
+    return ret;
 }
 
 int derive_key(const uint8_t *app_id, bool new_key, uint8_t *key_handle, int curve, mbedtls_ecp_keypair *key) {
@@ -564,7 +567,7 @@ int wait_button_pressed_timeout(uint32_t timeout_seconds) {
         event_send(OP_USER_PRESENCE, RC_NONE, fields, fields_len);
     }
     uint32_t val = EV_PRESS_BUTTON_WITH_TIMEOUT(timeout_seconds);
-#if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
+#if defined(PICO_PLATFORM) || defined(ESP_PLATFORM) || defined(ENABLE_EMULATION)
     queue_try_add(&card_to_usb_q, &val);
     do {
         queue_remove_blocking(&usb_to_card_q, &val);

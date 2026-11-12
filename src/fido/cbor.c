@@ -16,6 +16,7 @@
  */
 
 #include "picokeys.h"
+#include "button.h"
 #if defined(PICO_PLATFORM)
 #include "pico/stdlib.h"
 #endif
@@ -115,6 +116,7 @@ void *cbor_thread(void *arg) {
         size_t len = cbor_len;
         uint8_t cmd = cbor_cmd;
         apdu.sw = (uint16_t)cbor_parse(cmd, data, len);
+        if (cancel_button) { apdu.sw = CTAP2_ERR_KEEPALIVE_CANCEL; res_APDU_size = 0; }
         if (apdu.sw == 0) {
             DEBUG_DATA(res_APDU, res_APDU_size);
         }
@@ -142,6 +144,7 @@ void *cbor_thread(void *arg) {
 }
 
 int cbor_process(uint8_t last_cmd, const uint8_t *data, size_t len) {
+    cancel_button = false;
     cbor_data = data;
     cbor_len = len;
     cbor_cmd = last_cmd;

@@ -275,6 +275,13 @@ static const file_object_container_crypto_t *resident_legacy_crypto(const file_o
     return legacy->auth && legacy->protector ? legacy : NULL;
 }
 
+// A native credential creates six records, a manifest and a slot marker.
+enum { NATIVE_RESIDENT_RECORDS = 6, NATIVE_RESIDENT_FILES = NATIVE_RESIDENT_RECORDS + 2 };
+
+uint16_t resident_container_available_files_capacity(void) {
+    return file_dynamic_slots_available() / NATIVE_RESIDENT_FILES;
+}
+
 bool resident_container_can_create(uint8_t slot) {
     bool manifest_present = false;
     for (uint8_t manifest_slot = 0; manifest_slot < 2; manifest_slot++) {
@@ -359,6 +366,8 @@ int resident_container_create(uint8_t slot, const uint8_t rp_id_hash[RP_ID_HASH_
             .flags = FILE_OBJECT_FLAG_MUTABLE
         }
     };
+    _Static_assert(sizeof(writes) / sizeof(writes[0]) == NATIVE_RESIDENT_RECORDS,
+                   "resident capacity must account for each native record");
     return resident_container_update(slot, writes, sizeof(writes) / sizeof(writes[0]));
 }
 

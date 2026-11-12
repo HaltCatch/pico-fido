@@ -1,0 +1,26 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = 'Public mbedTLS curve identifiers'
+regexTarget = 'line'
+paths = ['''^src/fido/cbor_(get_assertion|make_credential)\.c$''']
+regexes = ['''MBEDTLS_ECP_DP_(SECP|BP|ED)''']
+condition = 'AND'
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = 'Public Pico protocol command identifier'
+regexTarget = 'line'
+paths = ['''^tools/pico-fido-tool\.py$''']
+regexes = ['''CONFIG_KEY_AGREEMENT\s*=\s*0x1831a40f04a25ed9''']
+condition = 'AND'
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = 'Upstream OpenThread sample master key'
+regexTarget = 'line'
+paths = ['''^sdkconfig$''']
+regexes = ['''CONFIG_OPENTHREAD_NETWORK_MASTERKEY="00112233445566778899aabbccddeeff"''']
+condition = 'AND'

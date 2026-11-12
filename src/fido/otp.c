@@ -16,6 +16,7 @@
  */
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include "picokeys.h"
 #include "serial.h"
 #include "button.h"
@@ -115,8 +116,8 @@ void append_keyboard_buffer(const_byte_array_t data) {
 #define CFGFLAG_UPDATE_MASK (PACING_10MS | PACING_20MS)
 
 static uint8_t config_seq = { 1 };
-static volatile uint8_t otp_status_config_seq = 1;
-static volatile uint8_t otp_status_config_flags = 0;
+static atomic_uchar otp_status_config_seq = 1;
+static atomic_uchar otp_status_config_flags = 0;
 
 PACK(
 typedef struct otp_config {
@@ -611,18 +612,20 @@ static int otp_button_pressed(uint8_t slot) {
     return 0;
 }
 
+#if ENABLE_OTP_APP
 INITIALIZER( otp_ctor ) {
     register_app(otp_select, otp_aid);
     button_pressed_cb = otp_button_pressed;
     hid_set_report_cb = otp_hid_set_report_cb;
     hid_get_report_cb = otp_hid_get_report_cb;
 }
+#endif
 
 static int otp_unload(void) {
     return PICOKEYS_OK;
 }
 
-uint8_t status_byte = 0x0;
+atomic_uchar status_byte = 0x0;
 static uint16_t otp_status_ext(void) {
     for (uint8_t i = 0; i < 4; i++) {
         uint16_t fid = (uint16_t)(EF_OTP_SLOT1 + i);
@@ -833,6 +836,11 @@ static int cmd_otp(void) {
             slot2 += apdu.data[1];
             memcpy(access_code, apdu.data + 2, sizeof(access_code));
         }
+        else if (apdu.nc == ACC_CODE_SIZE) {
+            // YubiKit's standard SWAP carries only the current access code.
+            // Explicit slot indices belong to the Pico Keys extension below.
+            memcpy(access_code, apdu.data, sizeof(access_code));
+        }
         else if (apdu.nc != 0) {
             if (apdu.nc != 2 && apdu.nc != 2 + ACC_CODE_SIZE) {
                 return SW_WRONG_LENGTH();
@@ -992,14 +1000,12 @@ static int cmd_otp(void) {
             if (otp_config->cfg_flags & CHAL_BTN_TRIG) {
                 status_byte = 0x20;
                 otp_status(_is_otp);
-#ifndef ENABLE_EMULATION
                 if (wait_button_pressed()) {
                     status_byte = 0x00;
                     otp_status(_is_otp);
                     mbedtls_platform_zeroize(data, sizeof(data));
                     return SW_CONDITIONS_NOT_SATISFIED();
                 }
-#endif
                 status_byte = 0x10;
                 apdu.rdata = rdata_bk;
             }
@@ -1083,33 +1089,103 @@ uint8_t otp_frame_rx[70] = {0};
 uint8_t otp_frame_tx[70] = {0};
 uint8_t otp_exp_seq = 0, otp_curr_seq = 0;
 uint8_t otp_header[4] = {0};
+enum { OTP_IDLE, OTP_QUEUED, OTP_RUNNING, OTP_READY };
+static atomic_int otp_state = OTP_IDLE;
+static atomic_bool otp_abort;
+static uint8_t otp_work_tx[USB_BUFFER_SIZE];
+static app_t otp_control_app = { .process_apdu = otp_process_apdu, .unload = otp_unload };
 
-static int otp_send_frame(uint8_t *frame, size_t frame_len) {
-    if (frame_len > (size_t)UINT8_MAX * 7u - sizeof(uint16_t)) {
-        return PICOKEYS_WRONG_LENGTH;
+/* Only the application loop may schedule work or borrow the global APDU.
+ * USB control callbacks only receive requests and drain completed responses. */
+void otp_hid_task(void) {
+    if (atomic_load(&otp_state) == OTP_RUNNING) {
+        if (atomic_load(&otp_abort)) cancel_button = true;
+        if (card_status(ITF_KEYBOARD) != PICOKEYS_OK) return;
+        _is_otp = false;
+        if (!atomic_load(&otp_abort) && apdu.sw == 0x9000 && apdu.rlen > 0 && apdu.rlen <= 64) {
+            memcpy(otp_frame_tx, otp_work_tx, apdu.rlen);
+            uint16_t crc = calculate_crc(otp_frame_tx, apdu.rlen);
+            put_uint16_le(~crc, otp_frame_tx + apdu.rlen);
+            *get_send_buffer_size(ITF_KEYBOARD) = apdu.rlen + 2;
+            otp_exp_seq = (uint8_t)((apdu.rlen + 8u) / 7u);
+            otp_curr_seq = 0;
+            atomic_store(&otp_state, OTP_READY);
+        } else {
+            atomic_store(&otp_state, OTP_IDLE);
+        }
+        mbedtls_platform_zeroize(otp_work_tx, sizeof(otp_work_tx));
     }
-    uint16_t crc = calculate_crc(frame, frame_len);
-    frame_len += put_uint16_le(~crc, frame + frame_len);
-    *get_send_buffer_size(ITF_KEYBOARD) = (uint16_t)frame_len;
-    otp_exp_seq = (uint8_t)((frame_len + 6u) / 7u);
-    otp_curr_seq = 0;
-    return 0;
+    if (is_busy()) return;
+    int expected = OTP_QUEUED;
+    if (!atomic_compare_exchange_strong(&otp_state, &expected, OTP_RUNNING)) return;
+    apdu_select_transport(ITF_KEYBOARD);
+    card_start(ITF_KEYBOARD, apdu_thread);
+    otp_header[0] = 0;
+    otp_header[1] = 1;
+    otp_header[2] = otp_frame_rx[64];
+    otp_header[3] = 0;
+    apdu.header = otp_header;
+    apdu.data = otp_frame_rx;
+    apdu.nc = 64;
+    apdu.ne = sizeof(otp_work_tx) - 2;
+    apdu.rlen = 0;
+    apdu.sw = 0;
+    apdu.rdata = otp_work_tx;
+    // Feature reports do not perform a smart-card SELECT or reset config_seq.
+    current_app = &otp_control_app;
+    apdu.ne = sizeof(otp_work_tx) - 2;
+    apdu.rlen = 0;
+    _is_otp = true;
+    cancel_button = false;
+    usb_set_timeout_counter(ITF_KEYBOARD, 200);
+    usb_send_event(EV_CMD_AVAILABLE);
+}
+
+// The dispatcher calls this only after bus-reset callbacks have blocked new
+// reports and the old worker has exited. Persistent slot settings stay intact.
+void otp_hid_session_reset(void) {
+    _is_otp = false;
+    atomic_store(&otp_state, OTP_IDLE);
+    atomic_store(&otp_abort, false);
+    otp_curr_seq = otp_exp_seq = 0;
+    mbedtls_platform_zeroize(otp_frame_rx, sizeof(otp_frame_rx));
+    mbedtls_platform_zeroize(otp_frame_tx, sizeof(otp_frame_tx));
+    mbedtls_platform_zeroize(otp_work_tx, sizeof(otp_work_tx));
+}
+
+/* Called only by the serialized USB control callback task. A reset may
+ * arrive while the application loop is publishing a completed response. */
+static void otp_discard_cancelled_response(void) {
+    if (atomic_load(&otp_abort) && atomic_load(&otp_state) == OTP_READY) {
+        *get_send_buffer_size(ITF_KEYBOARD) = 0;
+        otp_curr_seq = otp_exp_seq = 0;
+        mbedtls_platform_zeroize(otp_frame_tx, sizeof(otp_frame_tx));
+        atomic_store(&otp_state, OTP_IDLE);
+    }
 }
 
 static int otp_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize) {
-    (void)itf;
-    (void)report_id;
+    if (itf != ITF_HID_KB || report_id != 0) return 0;
     if (report_type == 3) {
-        if (buffer == NULL || bufsize < 8) {
+        otp_discard_cancelled_response();
+        if (buffer == NULL || bufsize != 8) {
             return 1;
         }
         DEBUG_PAYLOAD(buffer, bufsize);
         if (buffer[7] == 0xFF) { // reset
+            int expected = OTP_QUEUED;
+            atomic_compare_exchange_strong(&otp_state, &expected, OTP_IDLE);
+            if (atomic_load(&otp_state) == OTP_RUNNING) {
+                atomic_store(&otp_abort, true);
+                return 1;
+            }
+            atomic_store(&otp_state, OTP_IDLE);
             *get_send_buffer_size(ITF_KEYBOARD) = 0;
             otp_curr_seq = otp_exp_seq = 0;
             memset(otp_frame_tx, 0, sizeof(otp_frame_tx));
         }
         else if (buffer[7] & 0x80) { // a frame
+            if (atomic_load(&otp_state) != OTP_IDLE) return 1;
             uint8_t rseq = buffer[7] & 0x1F;
             if (rseq < 10) {
                 if (rseq == 0) {
@@ -1120,29 +1196,9 @@ static int otp_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type
                     DEBUG_DATA(otp_frame_rx, sizeof(otp_frame_rx));
                     DEBUG_PAYLOAD(otp_frame_rx, sizeof(otp_frame_rx));
                     uint16_t residual_crc = calculate_crc(otp_frame_rx, 64), rcrc = get_uint16_le(otp_frame_rx + 65);
-                    uint8_t slot_id = otp_frame_rx[64];
                     if (residual_crc == rcrc) {
-                        if (is_busy()) {
-                            return 1;
-                        }
-                        struct apdu apdu_bk = apdu;
-                        uint8_t hdr[5];
-                        apdu.header = hdr;
-                        apdu.data = otp_frame_rx;
-                        apdu.nc = 64;
-                        apdu.rlen = 0;
-                        apdu.rdata = otp_frame_tx;
-                        apdu.header[0] = 0;
-                        apdu.header[1] = 0x01;
-                        apdu.header[2] = slot_id;
-                        apdu.header[3] = 0;
-                        _is_otp = true;
-                        int ret = otp_process_apdu();
-                        if (ret == 0x9000 && res_APDU_size > 0) {
-                            otp_send_frame(apdu.rdata, apdu.rlen);
-                        }
-                        _is_otp = false;
-                        apdu = apdu_bk;
+                        atomic_store(&otp_abort, false);
+                        atomic_store(&otp_state, OTP_QUEUED);
                     }
                     else {
                         printf("[OTP] Bad CRC!\n");
@@ -1161,11 +1217,20 @@ static uint16_t otp_hid_get_report_cb(uint8_t itf,
                                       uint8_t *buffer,
                                       uint16_t reqlen) {
     // TODO not Implemented
-    (void) itf;
-    (void) report_id;
-    (void) report_type;
+    if (itf != ITF_HID_KB || report_id != 0 || report_type != 3) return 0;
     if (buffer == NULL || reqlen < 8) {
         return 0;
+    }
+    otp_discard_cancelled_response();
+    int state = atomic_load(&otp_state);
+    if (state == OTP_QUEUED || state == OTP_RUNNING) {
+        memset(buffer, 0, 8);
+        buffer[1] = PICO_FIDO_VERSION_MAJOR;
+        buffer[2] = PICO_FIDO_VERSION_MINOR;
+        buffer[4] = otp_status_config_seq;
+        buffer[5] = otp_status_config_flags;
+        buffer[7] = status_byte == 0x20 ? 0x20 : 0x80;
+        return 8;
     }
     uint16_t send_buffer_size = *get_send_buffer_size(ITF_KEYBOARD);
     if (send_buffer_size > 0) {
@@ -1181,23 +1246,16 @@ static uint16_t otp_hid_get_report_cb(uint8_t itf,
         buffer[7] = 0x40;
         DEBUG_DATA(buffer,8);
         otp_curr_seq = otp_exp_seq = 0;
+        atomic_store(&otp_state, OTP_IDLE);
     }
     else {
-        if (is_busy()) {
-            memset(buffer, 0, 8);
-            buffer[1] = PICO_FIDO_VERSION_MAJOR;
-            buffer[2] = PICO_FIDO_VERSION_MINOR;
-            buffer[4] = otp_status_config_seq;
-            buffer[5] = otp_status_config_flags;
-            buffer[7] = 0x80;
-            return reqlen;
-        }
-        struct apdu apdu_bk = apdu;
-        res_APDU = buffer;
-        otp_status(true);
-        apdu = apdu_bk;
-        DEBUG_DATA(buffer, 8);
+        memset(buffer, 0, 8);
+        buffer[1] = PICO_FIDO_VERSION_MAJOR;
+        buffer[2] = PICO_FIDO_VERSION_MINOR;
+        buffer[4] = otp_status_config_seq;
+        buffer[5] = otp_status_config_flags;
+
     }
 
-    return reqlen;
+    return 8;
 }

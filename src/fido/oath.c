@@ -63,6 +63,7 @@
 #define TAG_PWS_LOGIN       0x83
 #define TAG_PWS_PASSWORD    0x84
 #define TAG_PWS_METADATA    0x85
+#define TAG_LAST_CHALLENGE  0x86 // Internal field in the credential record.
 #define TAG_SERIAL_NUMBER   0x8F
 
 #define ALG_HMAC_SHA1       0x01
@@ -198,9 +199,11 @@ static int oath_select(app_t *a, uint8_t force) {
     return PICOKEYS_ERR_FILE_NOT_FOUND;
 }
 
+#if ENABLE_OATH_APP
 INITIALIZER ( oath_ctor ) {
     register_app(oath_select, oath_aid);
 }
+#endif
 
 static int oath_unload(void) {
     oath_chain_state.type = OATH_CHAIN_NONE;
@@ -334,6 +337,11 @@ static int oath_put_credential_data(file_t *ef, const uint8_t *data, size_t len)
     while (tlv_walk(&ctxi, &p, &item)) {
         uint16_t value_len = item.tag == TAG_KEY ? encrypted_len : (uint16_t)item.value.len;
         out_len += tlv_len_tag(item.tag, value_len);
+    }
+    if (out_len == 0 || out_len > UINT16_MAX) {
+        mbedtls_platform_zeroize(encrypted, encrypted_len);
+        free(encrypted);
+        return PICOKEYS_WRONG_DATA;
     }
     uint8_t *out = (uint8_t *)calloc(1, out_len);
     if (out == NULL) {
@@ -718,7 +726,7 @@ static int cmd_put(void) {
     if (validated == false) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
-    tlv_ctx_t ctxi, key = { 0 }, name = { 0 }, imf = { 0 };
+    tlv_ctx_t ctxi, key = { 0 }, name = { 0 }, imf = { 0 }, last = { 0 };
     uint16_t normalized_size = apdu.nc;
     uint8_t *put_copy = NULL;
     int ret = oath_normalize_put_property(apdu.data, apdu.nc, &put_copy, &normalized_size);
@@ -734,6 +742,10 @@ static int cmd_put(void) {
     size_t put_len = normalized_size;
     uint8_t *put_data = put_copy ? put_copy : apdu.data;
     tlv_ctx_init(BYTE_ARRAY(put_data, put_len), &ctxi);
+    if (tlv_find_tag(&ctxi, TAG_LAST_CHALLENGE, &last)) {
+        oath_put_copy_free(put_copy, put_len);
+        return SW_WRONG_DATA();
+    }
     if (tlv_find_tag(&ctxi, TAG_KEY, &key) == false) {
         oath_put_copy_free(put_copy, put_len);
         return SW_INCORRECT_PARAMS();
@@ -1111,6 +1123,48 @@ int calculate_oath(uint8_t truncate, const uint8_t *key, size_t key_len, const u
     return PICOKEYS_OK;
 }
 
+static int oath_calculate_totp(uint16_t fid, const oath_credential_data_t *credential,
+                              const tlv_ctx_t *key, bool increasing, uint8_t truncate,
+                              const uint8_t *challenge_data, size_t challenge_size) {
+    if (!increasing) {
+        return calculate_oath(truncate, key->data, key->len, challenge_data, challenge_size);
+    }
+
+    tlv_ctx_t fields, last = { 0 };
+    tlv_ctx_init(BYTE_ARRAY((uint8_t *)credential->data, credential->size), &fields);
+    bool has_last = tlv_find_tag(&fields, TAG_LAST_CHALLENGE, &last);
+    if (challenge_size != CHALLENGE_LEN ||
+        (has_last && (last.len != CHALLENGE_LEN ||
+                      memcmp(challenge_data, last.data, CHALLENGE_LEN) <= 0))) {
+        return PICOKEYS_WRONG_DATA;
+    }
+
+    int ret = calculate_oath(truncate, key->data, key->len, challenge_data, challenge_size);
+    if (ret != PICOKEYS_OK) {
+        return ret;
+    }
+
+    size_t size = credential->size + (has_last ? 0 : tlv_len_tag(TAG_LAST_CHALLENGE, CHALLENGE_LEN));
+    if (size > UINT16_MAX) {
+        return PICOKEYS_ERR_NO_MEMORY;
+    }
+    uint8_t *updated = malloc(size);
+    if (!updated) {
+        return PICOKEYS_ERR_NO_MEMORY;
+    }
+    memcpy(updated, credential->data, credential->size);
+    if (has_last) {
+        memcpy(updated + (last.data - credential->data), challenge_data, CHALLENGE_LEN);
+    }
+    else {
+        tlv_append(updated + credential->size, TAG_LAST_CHALLENGE, challenge_data, CHALLENGE_LEN);
+    }
+    ret = oath_credential_write(fid, updated, (uint16_t)size);
+    mbedtls_platform_zeroize(updated, size);
+    free(updated);
+    return ret == PICOKEYS_OK && flash_commit_sync(5000u) ? PICOKEYS_OK : PICOKEYS_ERR_NO_MEMORY;
+}
+
 static int cmd_calculate(void) {
     if (P2(apdu) != 0x0 && P2(apdu) != 0x1) {
         return SW_INCORRECT_P1P2();
@@ -1162,7 +1216,8 @@ static int cmd_calculate(void) {
         }
     }
 
-    if (tlv_find_tag(&ctxe, TAG_PROPERTY, &prop) == true && prop.len > 0 && (prop.data[0] & PROP_TOUCH) && !check_user_presence()) {
+    bool has_property = tlv_find_tag(&ctxe, TAG_PROPERTY, &prop) && prop.len > 0;
+    if (has_property && (prop.data[0] & PROP_TOUCH) && !check_user_presence()) {
         mbedtls_platform_zeroize(plain_key, plain_key_len);
         free(plain_key);
         oath_credential_close(&credential);
@@ -1216,16 +1271,15 @@ static int cmd_calculate(void) {
     }
 
     res_APDU[res_APDU_size++] = TAG_RESPONSE + P2(apdu);
-    int ret = calculate_oath(P2(apdu), key.data, key.len, effective_chal, effective_chal_len);
-    if (ret != PICOKEYS_OK) {
-        mbedtls_platform_zeroize(plain_key, plain_key_len);
-        free(plain_key);
-        oath_credential_close(&credential);
-        return SW_EXEC_ERROR();
-    }
+    int ret = is_hotp ? calculate_oath(P2(apdu), key.data, key.len, effective_chal, effective_chal_len) :
+                        oath_calculate_totp(fid, &credential, &key, has_property && (prop.data[0] & PROP_INC),
+                                            P2(apdu), effective_chal, effective_chal_len);
     mbedtls_platform_zeroize(plain_key, plain_key_len);
     free(plain_key);
     oath_credential_close(&credential);
+    if (ret == PICOKEYS_WRONG_DATA) return SW_DATA_INVALID();
+    if (ret == PICOKEYS_ERR_NO_MEMORY) return SW_MEMORY_FAILURE();
+    if (ret != PICOKEYS_OK) return SW_EXEC_ERROR();
     apdu.ne = res_APDU_size;
     return SW_OK();
 }
@@ -1269,7 +1323,8 @@ static int oath_calculate_all_next(void) {
             key.data = plain_key;
             key.len = plain_key_len;
             bool is_hotp = (key.data[0] & OATH_TYPE_MASK) == OATH_TYPE_HOTP;
-            bool touch_required = tlv_find_tag(&ctxe, TAG_PROPERTY, &prop) == true && prop.len > 0 && (prop.data[0] & PROP_TOUCH);
+            bool has_property = tlv_find_tag(&ctxe, TAG_PROPERTY, &prop) && prop.len > 0;
+            bool touch_required = has_property && (prop.data[0] & PROP_TOUCH);
             const mbedtls_md_info_t *md_info = get_oath_md_info(key.data[0]);
             size_t result_len = is_hotp || touch_required ? 3u : oath_chain_state.p2 == 1 ? 7u : (md_info ? mbedtls_md_get_size(md_info) + 3u : 0u);
             size_t response_len = 2u + name.len + result_len;
@@ -1301,9 +1356,20 @@ static int oath_calculate_all_next(void) {
                 res_APDU[res_APDU_size++] = key.data[1];
             }
             else {
+                uint16_t result_start = res_APDU_size;
                 res_APDU[res_APDU_size++] = TAG_RESPONSE + oath_chain_state.p2;
-                int ret = calculate_oath(oath_chain_state.p2, key.data, key.len, oath_chain_state.challenge, oath_chain_state.challenge_len);
+                int ret = oath_calculate_totp(fids[i], &credential, &key, has_property && (prop.data[0] & PROP_INC),
+                                              oath_chain_state.p2, oath_chain_state.challenge, oath_chain_state.challenge_len);
+                if (ret == PICOKEYS_ERR_NO_MEMORY) {
+                    mbedtls_platform_zeroize(plain_key, plain_key_len);
+                    free(plain_key);
+                    oath_credential_close(&credential);
+                    oath_chain_state.type = OATH_CHAIN_NONE;
+                    return SW_MEMORY_FAILURE();
+                }
                 if (ret != PICOKEYS_OK) {
+                    res_APDU_size = result_start;
+                    res_APDU[res_APDU_size++] = TAG_NO_RESPONSE;
                     res_APDU[res_APDU_size++] = 1;
                     res_APDU[res_APDU_size++] = key.data[1];
                 }

@@ -174,17 +174,14 @@ int cbor_cred_mgmt(const uint8_t *data, size_t len) {
                 CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);
             }
         }
-        uint8_t existing = 0;
-        for (int i = 0; i < MAX_RESIDENT_CREDENTIALS; i++) {
-            if (file_has_data(file_search((uint16_t)(EF_CRED + i)))) {
-                existing++;
-            }
-        }
+        uint16_t existing = 0;
+        uint16_t usable = 0;
+        credential_resident_capacity(&existing, &usable);
         CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 2));
         CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
         CBOR_CHECK(cbor_encode_uint(&mapEncoder, existing));
         CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x02));
-        CBOR_CHECK(cbor_encode_uint(&mapEncoder, MAX_RESIDENT_CREDENTIALS - existing));
+        CBOR_CHECK(cbor_encode_uint(&mapEncoder, usable));
     }
     else if (subcommand == 0x02 || subcommand == 0x03) {
         if (subcommand == 0x02) {
